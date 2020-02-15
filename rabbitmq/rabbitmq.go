@@ -1,6 +1,7 @@
 package rabbitmq
 
 import (
+	"log"
 	"time"
 
 	"sync/atomic"
@@ -148,4 +149,90 @@ func (ch *Channel) Consume(queue, consumer string, autoAck, exclusive, noLocal, 
 	}()
 
 	return deliveries, nil
+}
+
+func (ch *Channel) ExchangeDeclare(name, kind string, durable, autoDelete, internal, noWait bool, args amqp.Table) {
+	err := ch.Channel.ExchangeDeclare(name, kind, durable, autoDelete, internal, noWait, args)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	go func() {
+		for {
+			reason, ok := <-ch.Channel.NotifyClose(make(chan *amqp.Error))
+			// exit this goroutine if closed by developer
+			if !ok || ch.IsClosed() {
+				debug("channel closed")
+				_ = ch.Close() // close again, ensure closed flag set when connection closed
+				break
+			}
+			debug("channel closed, reason: %v", reason)
+
+			// reconnect if not closed by developer
+			for {
+				err := ch.Channel.ExchangeDeclare(name, kind, durable, autoDelete, internal, noWait, args)
+				if err == nil {
+					break
+				}
+				debugf("exchange redeclare failed, err: %v", err)
+				time.Sleep(delay * time.Second)
+			}
+		}
+	}()
+}
+
+func (ch *Channel) QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) {
+	_, err := ch.Channel.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	go func() {
+		for {
+			reason, ok := <-ch.Channel.NotifyClose(make(chan *amqp.Error))
+			if !ok || ch.IsClosed() {
+				debug("channel closed")
+				_ = ch.Close()
+				break
+			}
+			debug("channel closed, reason: %v", reason)
+
+			for {
+				_, err := ch.Channel.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
+				if err == nil {
+					break
+				}
+				debugf("queue redeclare failed, err: %v", err)
+				time.Sleep(delay * time.Second)
+			}
+		}
+	}()
+}
+
+func (ch *Channel) QueueBind(name, key, exchange string, noWait bool, args amqp.Table) {
+	err := ch.Channel.QueueBind(name, key, exchange, noWait, args)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	go func() {
+		for {
+			reason, ok := <-ch.Channel.NotifyClose(make(chan *amqp.Error))
+			if !ok || ch.IsClosed() {
+				debug("channel closed")
+				_ = ch.Close()
+				break
+			}
+			debug("channel closed, reason: %v", reason)
+
+			for {
+				err := ch.Channel.QueueBind(name, key, exchange, noWait, args)
+				if err == nil {
+					break
+				}
+				debugf("queue rebind failed, err: %v", err)
+				time.Sleep(delay * time.Second)
+			}
+		}
+	}()
 }

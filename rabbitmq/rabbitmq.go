@@ -2,9 +2,8 @@ package rabbitmq
 
 import (
 	"log"
-	"time"
-
 	"sync/atomic"
+	"time"
 
 	"github.com/streadway/amqp"
 )
@@ -17,15 +16,22 @@ type Connection struct {
 }
 
 // Channel wrap amqp.Connection.Channel, get a auto reconnect channel
-func (c *Connection) Channel() (*Channel, error) {
+func (c *Connection) Channel(exchange *Exchange, queue *Queue, bind *QueueBind) (*Channel, error) {
 	ch, err := c.Connection.Channel()
 	if err != nil {
 		return nil, err
 	}
 
 	channel := &Channel{
-		Channel: ch,
+		Channel:  ch,
+		exchange: exchange,
+		queue:    queue,
+		bind:     bind,
 	}
+
+	channel.exchangeDeclare()
+	channel.queueDeclare()
+	channel.queueBind()
 
 	go func() {
 		for {
@@ -33,7 +39,7 @@ func (c *Connection) Channel() (*Channel, error) {
 			// exit this goroutine if closed by developer
 			if !ok || channel.IsClosed() {
 				debug("channel closed")
-				channel.Close() // close again, ensure closed flag set when connection closed
+				_ = channel.Close() // close again, ensure closed flag set when connection closed
 				break
 			}
 			debug("channel closed, reason: %v", reason)
@@ -47,6 +53,9 @@ func (c *Connection) Channel() (*Channel, error) {
 				if err == nil {
 					debug("channel recreate success")
 					channel.Channel = ch
+					channel.exchangeDeclare()
+					channel.queueDeclare()
+					channel.queueBind()
 					break
 				}
 
@@ -103,12 +112,38 @@ func Dial(url string) (*Connection, error) {
 // Channel amqp.Channel wapper
 type Channel struct {
 	*amqp.Channel
-	closed int32
+	exchange *Exchange
+	queue    *Queue
+	bind     *QueueBind
+	closed   int32
+}
+
+type Queue struct {
+	QueueName  string
+	Durable    bool
+	AutoDelete bool
+	Exclusive  bool
+	Args       amqp.Table
+}
+
+type QueueBind struct {
+	Key  string
+	Args amqp.Table
+}
+
+type Exchange struct {
+	ExchangeName string
+	Kind         string
+	Durable      bool
+	AutoDelete   bool
+	Internal     bool
+	NoWait       bool
+	Args         amqp.Table
 }
 
 // IsClosed indicate closed by developer
 func (ch *Channel) IsClosed() bool {
-	return (atomic.LoadInt32(&ch.closed) == 1)
+	return atomic.LoadInt32(&ch.closed) == 1
 }
 
 // Close ensure closed flag set
@@ -151,88 +186,23 @@ func (ch *Channel) Consume(queue, consumer string, autoAck, exclusive, noLocal, 
 	return deliveries, nil
 }
 
-func (ch *Channel) ExchangeDeclare(name, kind string, durable, autoDelete, internal, noWait bool, args amqp.Table) {
-	err := ch.Channel.ExchangeDeclare(name, kind, durable, autoDelete, internal, noWait, args)
+func (ch *Channel) exchangeDeclare() {
+	err := ch.Channel.ExchangeDeclare(ch.exchange.ExchangeName, ch.exchange.Kind, ch.exchange.Durable, ch.exchange.AutoDelete, ch.exchange.Internal, ch.exchange.NoWait, ch.exchange.Args)
 	if err != nil {
 		log.Panic(err)
 	}
-
-	go func() {
-		for {
-			reason, ok := <-ch.Channel.NotifyClose(make(chan *amqp.Error))
-			// exit this goroutine if closed by developer
-			if !ok || ch.IsClosed() {
-				debug("channel closed")
-				_ = ch.Close() // close again, ensure closed flag set when connection closed
-				break
-			}
-			debug("channel closed, reason: %v", reason)
-
-			// reconnect if not closed by developer
-			for {
-				err := ch.Channel.ExchangeDeclare(name, kind, durable, autoDelete, internal, noWait, args)
-				if err == nil {
-					break
-				}
-				debugf("exchange redeclare failed, err: %v", err)
-				time.Sleep(delay * time.Second)
-			}
-		}
-	}()
 }
 
-func (ch *Channel) QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) {
-	_, err := ch.Channel.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
+func (ch *Channel) queueDeclare() {
+	_, err := ch.Channel.QueueDeclare(ch.queue.QueueName, ch.queue.Durable, ch.queue.AutoDelete, ch.queue.Exclusive, ch.exchange.NoWait, ch.queue.Args)
 	if err != nil {
 		log.Panic(err)
 	}
-
-	go func() {
-		for {
-			reason, ok := <-ch.Channel.NotifyClose(make(chan *amqp.Error))
-			if !ok || ch.IsClosed() {
-				debug("channel closed")
-				_ = ch.Close()
-				break
-			}
-			debug("channel closed, reason: %v", reason)
-
-			for {
-				_, err := ch.Channel.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
-				if err == nil {
-					break
-				}
-				debugf("queue redeclare failed, err: %v", err)
-				time.Sleep(delay * time.Second)
-			}
-		}
-	}()
 }
 
-func (ch *Channel) QueueBind(name, key, exchange string, noWait bool, args amqp.Table) {
-	err := ch.Channel.QueueBind(name, key, exchange, noWait, args)
+func (ch *Channel) queueBind() {
+	err := ch.Channel.QueueBind(ch.queue.QueueName, ch.bind.Key, ch.exchange.ExchangeName, ch.exchange.NoWait, ch.bind.Args)
 	if err != nil {
 		log.Panic(err)
 	}
-
-	go func() {
-		for {
-			reason, ok := <-ch.Channel.NotifyClose(make(chan *amqp.Error))
-			if !ok || ch.IsClosed() {
-				debug("channel closed")
-				_ = ch.Close()
-				break
-			}
-			debug("channel closed, reason: %v", reason)
-
-			for {
-				err := ch.Channel.QueueBind(name, key, exchange, noWait, args)
-				if err == nil {
-					break
-				}
-				debugf("queue rebind failed, err: %v", err)
-				time.Sleep(delay * time.Second)
-			}
-		}
-	}()
 }
